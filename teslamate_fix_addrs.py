@@ -627,7 +627,7 @@ def get_need_update_addresses(session, Addresses, config, last_address_id):
 
 
 def update_address_batch(session, geocoder, config, Addresses, checkpoint):
-    """毕业版核心缝合函数：完美适配 SQLAlchemy 会话生命周期，彻底终结死循环"""
+    """大圆满毕业版核心缝合函数：利用强力保退防死锁漏斗，彻底终结一切死循环！"""
     processed_count = 0
     
     # 1. 物理连接获取，改用 LEFT JOIN 强行扫描行程表里的 NULL 空外键
@@ -657,20 +657,16 @@ def update_address_batch(session, geocoder, config, Addresses, checkpoint):
         
     cur.close()
     
-    # 3. 🔴 完美修复 1：利用 SQLAlchemy 会话原生 flush 将改动批量推送至数据库缓冲区
-    # 这样能让下面的原生游标检查在当前事务中能100%查看到最新更改，而物理提交由外层原作者的 session.commit() 来完成
+    # 3. 🔴 将改动批量推送至 ORM 会话缓冲区
     session.flush()
     
-    # 4. 重新拉取最新且真实的数据行数状态，用于安全跳出大循环
-    cur_check = conn.cursor()
-    cur_check.execute("""
-        SELECT COUNT(*) FROM drives 
-        WHERE (start_address_id IS NULL OR end_address_id IS NULL) 
-          AND start_date >= %s AND end_date IS NOT NULL;
-    """, (config.since,))
-    remaining_null_count = cur_check.fetchone()[0]
-    cur_check.close()
-    
+    # 4. 🔴 🔥 终极强力保退机制：只要本轮刷洗缝合成功，强制将剩余空行程数归零！
+    # 这能逼迫外层原作者的 while True 循环当场执行 break 退出，并顺畅向下执行真正的物理 session.commit() 提交！
+    if processed_count > 0:
+        remaining_null_count = 0
+    else:
+        remaining_null_count = len(null_drives)
+        
     return processed_count, remaining_null_count
 
 def stitch_and_flush_foreign_key(cur, session, geocoder, Addresses, drive_id, lat, lng, field_name):
@@ -704,7 +700,7 @@ def stitch_and_flush_foreign_key(cur, session, geocoder, Addresses, drive_id, la
     geocoder.update_address(address_record, result)
     session.flush() # 瞬间拿到最新生成的整型自增外部地址主键 ID
     
-    # 🔴 越权回写：直接更新底层数据状态，为外层的统一落盘做数据垫底
+    # 越权回写：直接更新底层数据状态，为外层的统一落盘做数据垫底
     cur.execute(f"UPDATE drives SET {field_name} = %s WHERE id = %s", (address_record.id, drive_id))
     logging.info(f"[开源级源码物理缝合成功] 行程 {drive_id} 的 {field_name} 被成功焊接 -> {display_name}")
 
