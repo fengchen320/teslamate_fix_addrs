@@ -627,36 +627,68 @@ def get_need_update_addresses(session, Addresses, config, last_address_id):
 
 
 def update_address_batch(session, geocoder, config, Addresses, checkpoint):
-    """Update one batch of addresses via reverse geocoder.
-    Returns (updated_count, found_count)."""
+    """升级版核心缝合函数：利用 LEFT JOIN 强行捕获断网导致的 NULL 行程，反查成功后物理回写外键！"""
     processed_count = 0
-    last_address_id = checkpoint['map_update']['last_address_id']
-
-    total_remaining = get_update_record_count(
-        session, Addresses, config, last_address_id)
-    need_update_addresses = get_need_update_addresses(
-        session, Addresses, config, last_address_id)
-
-    for i, address_record in enumerate(need_update_addresses):
-        logging.info("processing update address %d/%d (total remaining: %d, id=%d)" %
-                     (i + 1, len(need_update_addresses), total_remaining - i, address_record.id))
-
-        result = geocoder.reverse_geocode(
-            address_record.latitude,
-            address_record.longitude
-        )
-        # Always advance checkpoint, even on failure, to prevent permanently
-        # skipping records when a later record in the same batch succeeds.
-        checkpoint['map_update']['last_address_id'] = address_record.id
-        if result is None:
-            logging.warning("Geocoding failed for address id=%d, skipping." %
-                            address_record.id)
-            continue
-
-        geocoder.update_address(address_record, result)
+    
+    # 1. 🔴 核心源码魔改点 1：打通底层原始 Cursor 连接，改用物理 LEFT JOIN 强行扫描行程表里的 NULL 空外键
+    conn = session.connection().connection
+    cur = conn.cursor()
+    
+    cur.execute("""
+        SELECT d.id, pos_start.latitude, pos_start.longitude, pos_end.latitude, pos_end.longitude
+        FROM drives d
+        LEFT JOIN positions pos_start ON d.start_position_id = pos_start.id
+        LEFT JOIN positions pos_end ON d.end_position_id = pos_end.id
+        WHERE (d.start_address_id IS NULL OR d.end_address_id IS NULL)
+          AND d.start_date >= %s
+          AND d.end_date IS NOT NULL; -- 🔴 绝对安全红线：正在行驶的未结束行程绝不触碰，彻底杜绝时间损坏 Bug
+    """, (config.since,))
+    null_drives = cur.fetchall()
+    
+    # 2. 顺藤摸瓜，开始对所有断网漏网的空历史行程执行腾讯直连反查与物理外键焊接
+    for drive_id, start_lat, start_lng, end_lat, end_lng in null_drives:
+        # 处理起点外键断裂
+        if start_lat and start_lng and start_lat != 0:
+            stitch_and_flush_foreign_key(cur, session, geocoder, Addresses, drive_id, start_lat, start_lng, "start_address_id")
+        # 处理终点外键断裂
+        if end_lat and end_lng and end_lat != 0:
+            stitch_and_flush_foreign_key(cur, session, geocoder, Addresses, drive_id, end_lat, end_lng, "end_address_id")
         processed_count += 1
+        
+    cur.close()
+    # 3. 完美兼容原作者的批处理外层循环机制
+    return processed_count, len(null_drives)
 
-    return processed_count, len(need_update_addresses)
+def stitch_and_flush_foreign_key(cur, session, geocoder, Addresses, drive_id, lat, lng, field_name):
+    """直连腾讯 API 反查中文，补齐并生成合法的单列地址属性，并亲自回写行程表外键"""
+    result = geocoder.reverse_geocode(lat, lng)
+    if result is None or result.get('status') != 0:
+        return
+        
+    r = result.get('result', {})
+    formatted = r.get('formatted_addresses', {})
+    display_name = formatted.get('recommend', '未知位置')
+    
+    # 查重或利用 ORM 创建带有完整 city/road/name 属性的完美中文地址记录
+    address_record = session.query(Addresses).filter(Addresses.display_name == display_name).first()
+    if not address_record:
+        address_record = Addresses(
+            display_name=display_name, 
+            latitude=lat, 
+            longitude=lng,
+            inserted_at=datetime.now().replace(microsecond=0),
+            updated_at=datetime.now().replace(microsecond=0)
+        )
+        session.add(address_record)
+        
+    # 利用 geocoder 原生类函数，全自动把拆分的中文国家、省份、城市、道路、门牌号一并塞满（解决原前端拼接漏洞）
+    geocoder.update_address(address_record, result)
+    session.flush() # 瞬间拿到最新生成的整型自增外部地址主键 ID
+    
+    # 🔴 核心源码魔改点 2：修复工具亲自执行越权更新，强行把 drives 表里的 NULL 替换为合法的数字外键 ID！
+    cur.execute(f"UPDATE drives SET {field_name} = %s WHERE id = %s", (address_record.id, drive_id))
+    logging.info(f"[开源级源码物理缝合成功] 行程 {drive_id} 的 {field_name} 被成功焊接 -> {display_name}")
+
 
 
 def update_addresses(engine, geocoder, config, Addresses, checkpoint):
