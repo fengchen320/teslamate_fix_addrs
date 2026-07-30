@@ -627,10 +627,10 @@ def get_need_update_addresses(session, Addresses, config, last_address_id):
 
 
 def update_address_batch(session, geocoder, config, Addresses, checkpoint):
-    """升级版核心缝合函数：利用 LEFT JOIN 强行捕获断网导致的 NULL 行程，反查成功后物理回写外键！"""
+    """毕业版核心缝合函数：利用 LEFT JOIN 捕获 NULL 行程，完美兼容循环机制与联合唯一索引！"""
     processed_count = 0
     
-    # 1. 🔴 核心源码魔改点 1：打通底层原始 Cursor 连接，改用物理 LEFT JOIN 强行扫描行程表里的 NULL 空外键
+    # 1. 打通底层原始 Cursor 连接，改用物理 LEFT JOIN 强行扫描行程表里的 NULL 空外键
     conn = session.connection().connection
     cur = conn.cursor()
     
@@ -645,7 +645,7 @@ def update_address_batch(session, geocoder, config, Addresses, checkpoint):
     """, (config.since,))
     null_drives = cur.fetchall()
     
-    # 2. 顺藤摸瓜，开始对所有断网漏网的空历史行程执行腾讯直连反查与物理外键焊接
+    # 2. 开始对所有断网漏网的空历史行程执行腾讯直连反查与物理外键焊接
     for drive_id, start_lat, start_lng, end_lat, end_lng in null_drives:
         # 处理起点外键断裂
         if start_lat and start_lng and start_lat != 0:
@@ -656,22 +656,38 @@ def update_address_batch(session, geocoder, config, Addresses, checkpoint):
         processed_count += 1
         
     cur.close()
-    # 3. 完美兼容原作者的批处理外层循环机制
-    return processed_count, len(null_drives)
+    
+    # 3. 🔴 完美修复：计算本轮处理后，数据库中真正还残留多少未缝合的 NULL 记录
+    # 只有当剩余空行程数量为 0 时，外部 while True 循环才会安全 break，进入正常的周期性休眠
+    cur_check = conn.cursor()
+    cur_check.execute("""
+        SELECT COUNT(*) FROM drives 
+        WHERE (start_address_id IS NULL OR end_address_id IS NULL) 
+          AND start_date >= %s AND end_date IS NOT NULL;
+    """, (config.since,))
+    remaining_null_count = cur_check.fetchone()[0]
+    cur_check.close()
+    
+    return processed_count, remaining_null_count
 
 def stitch_and_flush_foreign_key(cur, session, geocoder, Addresses, drive_id, lat, lng, field_name):
     """直连腾讯 API 反查中文，补齐并生成合法的单列地址属性，并亲自回写行程表外键"""
     result = geocoder.reverse_geocode(lat, lng)
-    if result is None or result.get('status') != 0:
+    if not result or result.get('status') != 0:
         return
         
     r = result.get('result', {})
     formatted = r.get('formatted_addresses', {})
     display_name = formatted.get('recommend', '未知位置')
     
-    # 查重或利用 ORM 创建带有完整 city/road/name 属性的完美中文地址记录
-    address_record = session.query(Addresses).filter(Addresses.display_name == display_name).first()
+    # 🔴 联合唯一键查重防护：名字相同 或 坐标完全对齐，均视为同一行记录，100% 豁免唯一索引冲突！
+    address_record = session.query(Addresses).filter(
+        (Addresses.display_name == display_name) | 
+        ((Addresses.latitude == lat) & (Addresses.longitude == lng))
+    ).first()
+    
     if not address_record:
+        from datetime import datetime # 🔴 局部模块防护：彻底根治 NameError 报错崩塌
         address_record = Addresses(
             display_name=display_name, 
             latitude=lat, 
@@ -681,14 +697,13 @@ def stitch_and_flush_foreign_key(cur, session, geocoder, Addresses, drive_id, la
         )
         session.add(address_record)
         
-    # 利用 geocoder 原生类函数，全自动把拆分的中文国家、省份、城市、道路、门牌号一并塞满（解决原前端拼接漏洞）
+    # 利用 geocoder 原生类函数，全自动把拆分数据塞满（解决原前端拼接漏洞）
     geocoder.update_address(address_record, result)
     session.flush() # 瞬间拿到最新生成的整型自增外部地址主键 ID
     
-    # 🔴 核心源码魔改点 2：修复工具亲自执行越权更新，强行把 drives 表里的 NULL 替换为合法的数字外键 ID！
+    # 🔴 越权回写：修复工具亲自执行越权更新，强行把 drives 表里的 NULL 替换为合法的数字外键 ID！
     cur.execute(f"UPDATE drives SET {field_name} = %s WHERE id = %s", (address_record.id, drive_id))
     logging.info(f"[开源级源码物理缝合成功] 行程 {drive_id} 的 {field_name} 被成功焊接 -> {display_name}")
-
 
 
 def update_addresses(engine, geocoder, config, Addresses, checkpoint):
